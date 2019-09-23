@@ -12,6 +12,7 @@ type ProxyTCPConn struct {
 	Closed  bool
 	chSend  chan *udpovertcp.UDPPacket
 	chIdle  chan int
+	chClose chan int
 	client  *UDPOverTCPClient
 	SrcAddr *net.UDPAddr
 }
@@ -22,6 +23,7 @@ func NewProxyTCPConn(client *UDPOverTCPClient, srcAddr *net.UDPAddr) *ProxyTCPCo
 		Closed:  false,
 		chSend:  ch,
 		chIdle:  make(chan int),
+		chClose: make(chan int),
 		client:  client,
 		SrcAddr: srcAddr,
 	}
@@ -33,7 +35,7 @@ func NewProxyTCPConn(client *UDPOverTCPClient, srcAddr *net.UDPAddr) *ProxyTCPCo
 	if c.client.ConcurrentCount > 1 {
 		go func() {
 			count := c.client.ConcurrentCount - 1
-			time.Sleep(10 * time.Second)
+			time.Sleep(5 * time.Second)
 			for i := 0; i < count; i++ {
 				go c.sendLoop()
 			}
@@ -64,7 +66,7 @@ func (c *ProxyTCPConn) sendLoop() {
 
 	go func() {
 		var packet udpovertcp.UDPPacket
-		for {
+		for !c.Closed {
 			err := D.Decode(&packet)
 			if err != nil {
 				break
@@ -77,8 +79,14 @@ func (c *ProxyTCPConn) sendLoop() {
 		}
 	}()
 
-	for {
-		packet, ok := <-c.chSend
+	var packet *udpovertcp.UDPPacket
+	var ok bool
+	for !c.Closed {
+		select {
+		case _, ok = <-c.chClose:
+		case packet, ok = <-c.chSend:
+		}
+		
 		if !ok {
 			break
 		}
@@ -91,14 +99,22 @@ func (c *ProxyTCPConn) sendLoop() {
 }
 
 func (c *ProxyTCPConn) Close() {
-	close(c.chSend)
-	close(c.chIdle)
-	c.Closed = true
+	if !c.Closed {
+		c.Closed = true
+		close(c.chClose)
+	}
 }
 
 func (c *ProxyTCPConn) Send(packet *udpovertcp.UDPPacket) {
-	c.chIdle <- 0
-	c.chSend <- packet
+	select {
+	case <-c.chClose:
+	case c.chIdle <- 0:
+	}
+	
+	select {
+	case <-c.chClose:
+	case c.chSend <- packet:
+	}
 }
 
 func (c *ProxyTCPConn) idleLoop() {
